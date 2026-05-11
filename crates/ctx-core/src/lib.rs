@@ -1,5 +1,6 @@
 mod command_run;
 mod index_cache;
+mod path_filters;
 mod read_cache;
 
 use std::collections::{HashMap, HashSet};
@@ -32,6 +33,7 @@ use index_cache::{
     load_index_cache_state, load_latest_index_cache_report, save_index_cache_state,
     write_index_cache_report,
 };
+use path_filters::{PathMatcher, SegmentMatcher};
 use read_cache::run_cached_read;
 pub use read_cache::{ReadCacheReport, ReadMode};
 
@@ -201,6 +203,7 @@ pub fn run_read(repo_root: &Path, path: &str, mode: ReadMode) -> Result<ReadCach
         mode,
         cfg.security.exclude_sensitive_files,
         &cfg.security.sensitive_patterns,
+        &cfg.security.ignored_files,
     )
 }
 
@@ -212,10 +215,11 @@ pub fn run_pack(
 ) -> Result<PackResult> {
     let cfg = load_or_default_config(repo_root)?;
     let max_lines = cfg.pruning.max_log_lines;
+    let sensitive_files = PathMatcher::contains_or_glob(&cfg.security.sensitive_patterns);
 
     let root_cause = if let Some(path) = attach {
         if cfg.security.exclude_sensitive_files
-            && is_sensitive_path(path, &cfg.security.sensitive_patterns)
+            && sensitive_files.matches_path(Some(repo_root), path)
         {
             audit_privacy_decision(
                 repo_root,
@@ -350,12 +354,24 @@ pub fn run_explain(repo_root: &Path, query: &str) -> Result<ExplainResult> {
 }
 
 pub fn run_index(repo_root: &Path, include_paths: &[String]) -> Result<usize> {
+    run_index_internal(repo_root, include_paths, false)
+}
+
+pub fn run_reindex(repo_root: &Path, include_paths: &[String]) -> Result<usize> {
+    run_index_internal(repo_root, include_paths, true)
+}
+
+fn run_index_internal(
+    repo_root: &Path,
+    include_paths: &[String],
+    prune_stale: bool,
+) -> Result<usize> {
     let cfg = load_or_default_config(repo_root)?;
     if !cfg.graph.enabled {
         bail!("graph is disabled in config")
     }
 
-    let store = GraphStore::open(&repo_root.join(&cfg.graph.store))?;
+    let mut store = GraphStore::open(&repo_root.join(&cfg.graph.store))?;
     store.init_schema()?;
 
     let roots: Vec<PathBuf> = if include_paths.is_empty() {
@@ -363,16 +379,21 @@ pub fn run_index(repo_root: &Path, include_paths: &[String]) -> Result<usize> {
     } else {
         include_paths.iter().map(|p| repo_root.join(p)).collect()
     };
+    let ignored_dirs = SegmentMatcher::new(&cfg.security.ignored_dirs);
+    let ignored_files = PathMatcher::exact_or_glob(&cfg.security.ignored_files);
+    let sensitive_files = PathMatcher::contains_or_glob(&cfg.security.sensitive_patterns);
 
     let mut indexed = 0usize;
     let mut indexed_files = Vec::new();
     let previous_state = load_index_cache_state(repo_root)?;
     let mut next_state = previous_state.clone();
+    next_state.files.clear();
     let mut report = IndexCacheReport::default();
+    let mut scanned_relative_paths = HashSet::new();
     for root in roots {
         for entry in WalkDir::new(root)
             .into_iter()
-            .filter_entry(|e| !is_ignored_dir(e.path(), &cfg.security.ignored_dirs))
+            .filter_entry(|e| !ignored_dirs.matches_path(e.path()))
             .filter_map(std::result::Result::ok)
             .filter(|e| e.file_type().is_file())
         {
@@ -380,8 +401,19 @@ pub fn run_index(repo_root: &Path, include_paths: &[String]) -> Result<usize> {
             if !is_code_file(path) {
                 continue;
             }
+            if ignored_files.matches_path(Some(repo_root), path) {
+                audit_privacy_decision(
+                    repo_root,
+                    &cfg,
+                    "excluded",
+                    Some(path),
+                    "ignored_file_pattern",
+                    "skipped ignored file during indexing",
+                );
+                continue;
+            }
             if cfg.security.exclude_sensitive_files
-                && is_sensitive_path(path, &cfg.security.sensitive_patterns)
+                && sensitive_files.matches_path(Some(repo_root), path)
             {
                 audit_privacy_decision(
                     repo_root,
@@ -402,6 +434,7 @@ pub fn run_index(repo_root: &Path, include_paths: &[String]) -> Result<usize> {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .to_string();
+            scanned_relative_paths.insert(rel.clone());
             let fingerprint = compute_fingerprint(&content);
             let unchanged = previous_state
                 .files
@@ -423,6 +456,8 @@ pub fn run_index(repo_root: &Path, include_paths: &[String]) -> Result<usize> {
                 continue;
             }
 
+            let _ = store.remove_file(&rel);
+
             store.index_file(&rel)?;
             upsert_symbols_and_snippets(&store, &rel, &content)?;
             indexed_files.push((rel.clone(), content));
@@ -432,6 +467,27 @@ pub fn run_index(repo_root: &Path, include_paths: &[String]) -> Result<usize> {
                 report.changed_files += 1;
             } else {
                 report.new_files += 1;
+            }
+        }
+    }
+
+    if prune_stale {
+        for rel in previous_state.files.keys() {
+            if scanned_relative_paths.contains(rel) {
+                continue;
+            }
+            if !should_prune_stale_entry(rel, include_paths) {
+                if let Some(entry) = previous_state.files.get(rel) {
+                    next_state.files.insert(rel.clone(), entry.clone());
+                }
+                continue;
+            }
+            let _ = store.remove_file(rel);
+        }
+    } else {
+        for (rel, entry) in &previous_state.files {
+            if !next_state.files.contains_key(rel) {
+                next_state.files.insert(rel.clone(), entry.clone());
             }
         }
     }
@@ -456,6 +512,18 @@ pub fn run_index(repo_root: &Path, include_paths: &[String]) -> Result<usize> {
     );
 
     Ok(indexed)
+}
+
+fn should_prune_stale_entry(rel_path: &str, include_paths: &[String]) -> bool {
+    if include_paths.is_empty() {
+        return true;
+    }
+
+    let normalized_rel = rel_path.replace('\\', "/");
+    include_paths.iter().any(|path| {
+        let normalized = path.trim_matches('/').replace('\\', "/");
+        normalized_rel == normalized || normalized_rel.starts_with(&format!("{normalized}/"))
+    })
 }
 
 pub fn run_graph_query(repo_root: &Path, query: &str) -> Result<Vec<String>> {
@@ -1573,16 +1641,6 @@ fn answer_success_rate(answer_path: Option<&Path>, checklist: &[String]) -> Resu
     Ok((matched as f64 / checklist.len() as f64).clamp(0.0, 1.0))
 }
 
-fn is_ignored_dir(path: &Path, ignored_dirs: &[String]) -> bool {
-    path.components().any(|component| {
-        component
-            .as_os_str()
-            .to_str()
-            .map(|name| ignored_dirs.iter().any(|ignored| ignored == name))
-            .unwrap_or(false)
-    })
-}
-
 fn is_code_file(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
         return false;
@@ -1609,13 +1667,6 @@ fn is_code_file(path: &Path) -> bool {
             | "h"
             | "hpp"
     )
-}
-
-fn is_sensitive_path(path: &Path, patterns: &[String]) -> bool {
-    let lower = path.to_string_lossy().to_lowercase();
-    patterns
-        .iter()
-        .any(|pattern| lower.contains(&pattern.to_lowercase()))
 }
 
 fn audit_privacy_decision(

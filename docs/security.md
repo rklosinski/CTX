@@ -35,6 +35,12 @@ Default patterns:
 sensitive_patterns = [".env", "id_rsa", ".pem", ".key", "credentials", "secret"]
 ```
 
+Default file ignores skip common local artifacts and generated noise:
+
+```toml
+ignored_files = ["*.db", "*.sqlite", "*.sqlite3", "*.pyc", "*.pyo", "*.pem", "*.log", ".env", "*.env", ".coverage", ".coverage.*", ".DS_Store", "Thumbs.db", "package-lock.json"]
+```
+
 Example:
 
 ```bash
@@ -46,6 +52,19 @@ Expected behavior:
 ```text
 attachment .env matches sensitive file patterns and was blocked
 ```
+
+Default directory ignores also skip common build, cache, virtualenv, editor, and worktree folders such as `.venv`, `__pycache__`, `.pytest_cache`, `.vscode`, and `.claude`. Directory ignores support glob-style component patterns such as `*.egg-info`, and file ignores support basename or path globs such as `package-lock.json` and `docs/*.md`. These ignore rules apply to indexing and `ctx read`; `ctx pack --attach` still allows diagnostic files like `.log` attachments and only blocks sensitive patterns.
+
+## WSL Performance Tip
+
+On WSL, lots of small filesystem writes can make graph indexing noticeably slower than on native Linux paths. If you want a much faster ephemeral graph store, point the graph database at the RAM-backed `/dev/shm` filesystem:
+
+```toml
+[graph]
+store = "/dev/shm/my-project-graph.db"
+```
+
+This is often much faster on WSL, but the graph DB is volatile and will be lost on reboot.
 
 ## MCP Boundary
 

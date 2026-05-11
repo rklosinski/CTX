@@ -204,6 +204,7 @@ pub struct SecurityConfig {
     pub exclude_sensitive_files: bool,
     pub sensitive_patterns: Vec<String>,
     pub ignored_dirs: Vec<String>,
+    pub ignored_files: Vec<String>,
 }
 
 impl Default for SecurityConfig {
@@ -226,6 +227,21 @@ impl Default for SecurityConfig {
             ignored_dirs: vec![
                 ".git".to_string(),
                 ".ctx".to_string(),
+                ".venv".to_string(),
+                "venv".to_string(),
+                "env".to_string(),
+                "__pycache__".to_string(),
+                ".pytest_cache".to_string(),
+                ".ruff_cache".to_string(),
+                ".mypy_cache".to_string(),
+                ".tox".to_string(),
+                ".nox".to_string(),
+                ".idea".to_string(),
+                ".vscode".to_string(),
+                ".claude".to_string(),
+                ".superpowers".to_string(),
+                ".eggs".to_string(),
+                "htmlcov".to_string(),
                 "target".to_string(),
                 "node_modules".to_string(),
                 "build".to_string(),
@@ -234,6 +250,22 @@ impl Default for SecurityConfig {
                 ".next".to_string(),
                 ".cache".to_string(),
                 "coverage".to_string(),
+            ],
+            ignored_files: vec![
+                "*.db".to_string(),
+                "*.sqlite".to_string(),
+                "*.sqlite3".to_string(),
+                "*.pyc".to_string(),
+                "*.pyo".to_string(),
+                "*.pem".to_string(),
+                "*.log".to_string(),
+                ".env".to_string(),
+                "*.env".to_string(),
+                ".coverage".to_string(),
+                ".coverage.*".to_string(),
+                ".DS_Store".to_string(),
+                "Thumbs.db".to_string(),
+                "package-lock.json".to_string(),
             ],
         }
     }
